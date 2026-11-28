@@ -10,12 +10,17 @@ It runs beside [Romdex](https://github.com/Dextrd/Romdex) as a container of its 
 
 ## What it does
 
-- **Search.** Asks Prowlarr's console categories for the game's name. The best-named torrents have their .torrent file
-  read, and a torrent is offered only when it has one of the game's dumps, as the DAT names them:
+- **Search.** Asks Prowlarr's console categories for the game's name, for its name with its system's (`The Legend of
+  Zelda NES`), and for its system's name (`Nintendo Entertainment System`), which finds torrents of a whole set.
+  Torrents are ranked by how alike their names are to the game's, so a sequel or another game of the series ranks
+  lower, and by the system they name: the game's own first, none next, another's (`Switch`, `[NSP]`, `Wii U`) far
+  below. The best-named torrents, and the best-seeded few named for the game's system, have their .torrent file read,
+  and a torrent is offered only when it has one of the game's dumps, as the DAT names them:
   - its own files by name, such as `Pixel Pond (USA).gb`, or a disc's cue sheet and every track; with the DAT's sizes
     too, that's a score of 1;
   - an archive or a CHD named after the dump, such as `Pixel Pond (USA).7z`, which Romdex reads inside;
-  - failing those, the file named most like the dump, if it's at least as alike as **Lowest match score**.
+  - failing those, the file named most like the dump, if it's at least as alike as **Lowest match score**; files
+    only another system has, such as Switch's `.nsp`, aren't.
 
   A torrent of a whole system's set is offered for the one game's files. The dump you asked for is the one looked
   for; otherwise any, the one your preferences put first winning a tie. Torrents that only come as a magnet link
