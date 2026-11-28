@@ -64,12 +64,19 @@ class FakeProwlarr:
     def __init__(self, results, torrents):
         self.results, self.torrents, self.queries, self.keys = results, torrents, [], []
         self.answers = lambda query: True  # whether the indexers have anything for a search
+        self.failing: set[str] = set()  # searches Prowlarr fails
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.keys.append(request.headers.get("X-Api-Key") or request.url.params.get("apikey"))
         if request.url.path == "/api/v1/search":
-            self.queries.append(request.url.params["query"])
-            return httpx.Response(200, json=self.results if self.answers(request.url.params["query"]) else [])
+            q = request.url.params["query"]
+            self.queries.append(q)
+            if not self.answers(q):
+                return httpx.Response(200, json=[])
+            if q in self.failing:
+                return httpx.Response(500)
+            # Results for every search, or for each its own.
+            return httpx.Response(200, json=self.results.get(q, []) if isinstance(self.results, dict) else self.results)
         if request.url.path == "/api/v1/system/status":
             return httpx.Response(200, json={"version": "2.6.5"})
         if request.url.path == "/api/v1/indexer":
@@ -263,7 +270,8 @@ def test_a_game_is_offered_from_torrents_with_a_file_named_as_its_dat_names_a_du
     assert "apikey" not in chosen["t"]
     assert candidates[0]["format"] == "gb" and candidates[0]["size"] == 32768
     assert "just these files" in candidates[0]["notes"]
-    assert prowlarr.queries == ["Pixel Pond"]
+    # The game, and its system for torrents of a whole set; a system Romdex doesn't know has no short name to add.
+    assert sorted(prowlarr.queries) == ["Handheld", "Pixel Pond"]
 
 
 def test_the_dump_asked_for_is_the_one_offered(fakes):
@@ -300,6 +308,90 @@ def test_a_magnet_only_release_is_offered_lower_on_its_name(fakes):
     [candidate] = search(client, settings, POND_GAME)
     assert json.loads(candidate["candidateId"]) == {"h": "ab" * 20, "m": magnet, "d": None, "f": None}
     assert 0.6 <= candidate["score"] < 0.9
+
+
+# The Legend of Zelda on the NES, which shares its name with games on every Nintendo system since.
+ZELDA_GAME = {"system": "Nintendo - Nintendo Entertainment System", "title": "The Legend of Zelda", "dumps": [
+    {"name": "Legend of Zelda, The (Europe) (Rev 1)", "regions": ["Europe"],
+     "files": [{"name": "Legend of Zelda, The (Europe) (Rev 1).nes", "size": 131088}]},
+]}
+
+
+def link(file):
+    return f"http://prowlarr:9696/1/download?file={file}"
+
+
+def test_a_game_is_found_on_its_own_system_among_better_seeded_games_of_the_same_name(fakes):
+    client, prowlarr, _, settings = fakes
+    zelda = [("Legend of Zelda, The (Europe) (Rev 1).nes", 131088)]
+    nes_set = [("Nintendo - Nintendo Entertainment System (Headered)/Legend of Zelda, The (Europe) (Rev 1).nes", 131088),
+               ("Nintendo - Nintendo Entertainment System (Headered)/Zap Lily (USA).nes", 40976)]
+    prowlarr.torrents["nes"], _ = make_torrent("The Legend of Zelda (NES)", zelda)
+    prowlarr.torrents["set"], _ = make_torrent("No-Intro NES", nes_set)
+    # Ten games of the same name on later systems, all better seeded; one as a file named just as the NES game is.
+    later = [release(f"The Legend of Zelda {name} [NSP]", link(f"later{i}"), seeders=900 - i)
+             for i, name in enumerate(["Breath of the Wild", "Tears of the Kingdom", "Links Awakening",
+                                       "Skyward Sword HD", "Echoes of Wisdom"])]
+    later += [release(f"The Legend of Zelda {name} (Wii U)", link(f"later{i + 5}"), seeders=500 - i)
+              for i, name in enumerate(["Breath of the Wild", "Twilight Princess HD", "Wind Waker HD"])]
+    for i in range(8):
+        prowlarr.torrents[f"later{i}"], _ = make_torrent("Zelda", [("The Legend of Zelda.nsp", 10 ** 9)])
+    magnet = "magnet:?xt=urn:btih:" + "cd" * 20
+    prowlarr.results = {
+        "The Legend of Zelda": [*later, release("The Legend of Zelda Breath of the Wild", magnet=magnet, seeders=2000)],
+        "The Legend of Zelda NES": [release("The Legend of Zelda (NES)", link("nes"), seeders=3)],
+        "Nintendo Entertainment System": [release("Nintendo - Nintendo Entertainment System (Headered) (No-Intro 2025)",
+                                                  link("set"), seeders=20)],
+    }
+    candidates = search(client, settings, ZELDA_GAME)
+    assert sorted(prowlarr.queries) == ["Nintendo Entertainment System", "The Legend of Zelda", "The Legend of Zelda NES"]
+    # Just the NES game, from the torrent of the game and from the set; none of the later games, magnet link or not.
+    assert [(c["dumpName"], c["source"], c["score"]) for c in candidates] == [
+        ("Legend of Zelda, The (Europe) (Rev 1)", "Test tracker (20 seeders)", 1.0),
+        ("Legend of Zelda, The (Europe) (Rev 1)", "Test tracker (3 seeders)", 1.0)]
+    assert json.loads(candidates[0]["candidateId"])["f"] == [[0, f"No-Intro NES/{nes_set[0][0]}"]]
+
+
+def test_a_release_named_for_another_system_ranks_below_the_games_own():
+    target = retrieve.Target.model_validate(ZELDA_GAME)
+    score = lambda name: retrieve.title_score(target, name)
+    assert score("The Legend of Zelda (NES)") == 1.0
+    assert score("The Legend of Zelda (Famicom) [Europe]") == 1.0
+    # Unsaid, it may be the game, but less surely.
+    assert score("The Legend of Zelda") == pytest.approx(retrieve.NO_SYSTEM)
+    # Another game of the series has words of its own; on another system, it's further down still.
+    assert score("The Legend of Zelda Breath of the Wild") < 0.65
+    assert score("The Legend of Zelda Breath of the Wild [NSP]") < 0.35
+    assert score("The Legend of Zelda (Switch)") == pytest.approx(retrieve.OTHER_SYSTEM)
+    # The SNES's long name isn't read as the NES's it ends with.
+    snes = retrieve.Target.model_validate({**ZELDA_GAME, "system": "Nintendo - Super Nintendo Entertainment System",
+                                           "title": "A Link to the Past"})
+    assert retrieve.system_fit(snes, "Zelda - A Link to the Past (Super Nintendo Entertainment System)")[0] == retrieve.ON_SYSTEM
+    assert retrieve.system_fit(target, "Zelda - A Link to the Past (Super Nintendo Entertainment System)")[0] == retrieve.OTHER_SYSTEM
+    # A system's name in the game's own isn't the system it's for.
+    wars = retrieve.Target.model_validate({**ZELDA_GAME, "title": "Famicom Wars", "dumps": []})
+    assert retrieve.system_fit(wars, "Famicom Wars")[0] == retrieve.NO_SYSTEM
+
+
+def test_another_systems_file_isnt_offered_for_a_name_like_the_games(fakes):
+    client, prowlarr, _, settings = fakes
+    prowlarr.torrents["switch"], _ = make_torrent("Zelda", [("Legend of Zelda, The (Europe).nsp", 10 ** 9)])
+    prowlarr.torrents["nes"], _ = make_torrent("Zelda", [("Legend of Zelda, The (Europe).nes", 131088)])
+    prowlarr.results = [release("The Legend of Zelda [EU]", link("switch"), seeders=50),
+                        release("The Legend of Zelda (Europe)", link("nes"), seeders=5)]
+    [candidate] = search(client, settings, ZELDA_GAME)
+    assert json.loads(candidate["candidateId"])["f"] == [[0, "Zelda/Legend of Zelda, The (Europe).nes"]]
+
+
+def test_the_games_search_failing_fails_but_the_others_only_add_to_it(fakes):
+    client, prowlarr, _, settings = fakes
+    prowlarr.torrents["nes"], _ = make_torrent("Zelda", [("Legend of Zelda, The (Europe) (Rev 1).nes", 131088)])
+    prowlarr.results = [release("The Legend of Zelda (NES)", link("nes"))]
+    prowlarr.failing = {"The Legend of Zelda NES", "Nintendo Entertainment System"}
+    assert len(search(client, settings, ZELDA_GAME)) == 1
+    prowlarr.failing = {"The Legend of Zelda"}
+    response = client.post("/v1/search", json={"settings": settings, "target": ZELDA_GAME})
+    assert response.status_code == 502
 
 
 def test_a_game_is_downloaded_with_just_its_file_and_left_seeding(fakes):

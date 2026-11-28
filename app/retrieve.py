@@ -18,17 +18,18 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from . import reflinks
+from . import reflinks, systems
 from . import torrent as torrents
 from .clients import Prowlarr, QBittorrent, without_key
 from .contract import Candidate, Job, Target, TargetDump
-from .matching import covers, similarity
+from .matching import similarity, words
 
 AFTER = ["keep", "remove"]
 POLL_SECONDS = 2.0
 ADD_WAIT_SECONDS = 60.0
 
-_CHECKED = 6  # torrents whose file lists are read per search
+_CHECKED = 8  # torrents named like the game whose file lists are read per search
+_SETS = 3  # and torrents named for its system, such as a whole set, which don't name the game
 # What a dump may come as besides its own files, which Romdex reads inside.
 CONTAINERS = {".zip", ".7z", ".chd", ".rvz"}
 # Never a game: what releases bring along.
@@ -51,9 +52,10 @@ def dumps(target: Target) -> list[TargetDump]:
     return [d for d in target.dumps if not target.dump_name or d.name == target.dump_name]
 
 
-def match_dump(dump: TargetDump, files: list[torrents.TorrentFile], min_score: float) -> tuple[list[torrents.TorrentFile], float] | None:
+def match_dump(dump: TargetDump, files: list[torrents.TorrentFile], min_score: float,
+               foreign: frozenset[str] = frozenset()) -> tuple[list[torrents.TorrentFile], float] | None:
     """The dump's files in the torrent, and how sure that is: its own files by name, an archive or a CHD named after
-    it, or failing those the file named most like it."""
+    it, or failing those the file named most like it, but for files of other systems (`foreign`, such as .nsp)."""
     by_name: dict[str, list[torrents.TorrentFile]] = {}
     for f in files:
         by_name.setdefault(PurePosixPath(f.path).name.lower(), []).append(f)
@@ -66,7 +68,7 @@ def match_dump(dump: TargetDump, files: list[torrents.TorrentFile], min_score: f
     name = dump.name.lower()
     if packed := [f for f in files if stem(f.path).lower() == name and suffix(f.path) in CONTAINERS]:
         return [packed[0]], 0.95
-    games = [f for f in files if suffix(f.path) not in EXTRAS]
+    games = [f for f in files if suffix(f.path) not in EXTRAS and suffix(f.path) not in foreign]
     best = max(games, key=lambda f: similarity(dump.name, stem(f.path)), default=None)
     if best is None or (score := similarity(dump.name, stem(best.path)) * 0.9) < min_score:
         return None
@@ -81,8 +83,9 @@ def match(target: Target, files: list[torrents.TorrentFile], min_score: float) -
     """The best of the game's dumps the torrent has, its files, and how sure that is; the preferred dump between
     equally good ones."""
     found = None
+    foreign = _foreign(target)
     for i, dump in enumerate(dumps(target)):
-        if (matched := match_dump(dump, files, min_score)) is None:
+        if (matched := match_dump(dump, files, min_score, foreign)) is None:
             continue
         score = matched[1] - min(i, 5) * 0.01
         if found is None or score > found[2]:
@@ -92,9 +95,52 @@ def match(target: Target, files: list[torrents.TorrentFile], min_score: float) -
 
 # ---- Search ----
 
+# How a release's name counts for the game, by the system it says it's for.
+ON_SYSTEM, NO_SYSTEM, OTHER_SYSTEM = 1.0, 0.9, 0.5
+# Words in releases' names that don't say which game it is: who dumped it, its region and the like.
+_TAGS = {"rom", "roms", "romset", "nointro", "no", "intro", "redump", "tosec", "headered", "headerless", "verified",
+         "set", "complete", "full", "usa", "us", "europe", "eu", "eur", "pal", "ntsc", "japan", "jp", "jpn", "jap",
+         "world", "en", "multi", "rev", "proper", "repack", "cart", "cartridge"}
+_YEAR = re.compile(r"(19|20)\d\d$")
+
+
+def _own_name(target: Target) -> str:
+    """The system's name without its maker or what's in brackets: Nintendo Entertainment System."""
+    return target.system.split(" (")[0].split(" - ", 1)[-1]
+
+
+def _foreign(target: Target) -> frozenset[str]:
+    """Extensions of other systems' games, such as Switch's .nsp for a NES game."""
+    own = systems.find(target.system)
+    return frozenset(f".{e}" for s in systems.ALL if s is not own for e in s.extensions)
+
+
+def system_fit(target: Target, name: str) -> tuple[float, set[str]]:
+    """Whether a release's name says it's for the game's system, another, or none; and the words that said so. A name
+    that has the game's system counts as on it, whatever else it names, as packs of several systems do."""
+    own = systems.find(target.system)
+    found, used = systems.mentions(name, ignore=words(target.title), extra=[] if own else [(_own_name(target), None)])
+    if own in found:
+        return ON_SYSTEM, used
+    return (OTHER_SYSTEM if found else NO_SYSTEM), used
+
+
+def name_fit(target: Target, name: str) -> float:
+    """How alike a release's name is to the game's, from 0 to 1, leaving out the words that name a system, a region or
+    who dumped it: a sequel or another game of the series has words of its own, which count against it."""
+    title = words(target.title)
+    tags = _TAGS | {w for d in dumps(target) for part in re.findall(r"\(([^)]*)\)", d.name) for w in words(part)
+                    if not w.isdigit()}
+    _, used = system_fit(target, name)
+    rest = {w for w in words(name) if w in title or not (w in used or w in tags or _YEAR.match(w))}
+    return len(title & rest) / len(title | rest) if title and rest else 0.0
+
+
 def title_score(target: Target, name: str) -> float:
-    """How well a torrent's name fits the game before its files are looked at."""
-    return max([covers(target.title, name) * 0.9, *(similarity(d.name, name) for d in dumps(target))])
+    """How well a torrent's name fits the game before its files are looked at: as the game or one of its dumps, on its
+    system."""
+    fit, _ = system_fit(target, name)
+    return fit * max([name_fit(target, name), *(similarity(d.name, name) for d in dumps(target))])
 
 
 def query(title: str) -> str:
@@ -102,17 +148,38 @@ def query(title: str) -> str:
     return " ".join(re.findall(r"\w+", title))
 
 
+def queries(target: Target) -> list[str]:
+    """The game's name; the game's name with its system's, which finds it among others' games of the same name; and
+    the system's, which finds torrents of a whole set."""
+    title = query(target.title)
+    own = systems.find(target.system)
+    found = [title, f"{title} {query(own.short)}" if own else "", query(own.name if own else _own_name(target))]
+    return list(dict.fromkeys(q for q in found if q))
+
+
 def search(target: Target, limit: int, settings: dict[str, Any]) -> list[Candidate]:
     min_score = float(settings.get("minScore", 0.6))
     min_seeders = int(settings.get("minSeeders", 1))
-    with Prowlarr(settings) as prowlarr:
+    with Prowlarr(settings) as prowlarr, ThreadPoolExecutor(max_workers=4) as pool:
+        first, *more = queries(target)
+        others = [pool.submit(prowlarr.search, q) for q in more]
+        results = list(prowlarr.search(first))
+        for other in others:
+            # The game's own search has to work; the others only add to it.
+            try:
+                results += other.result()
+            except Exception:
+                pass
         releases: dict[str, dict[str, Any]] = {}
-        for release in prowlarr.search(query(target.title)):
+        for release in results:
             if (release.get("seeders") or 0) >= min_seeders:
                 releases.setdefault(release.get("infoHash") or release.get("guid") or release["title"], release)
         ranked = sorted(releases.values(), key=lambda r: (title_score(target, r["title"]), r.get("seeders") or 0), reverse=True)
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            checked = list(pool.map(lambda r: (r, _files(prowlarr, r)), ranked[:_CHECKED]))
+        named = ranked[:_CHECKED]
+        # A set's name doesn't name the game, so those named for its system are looked in too, the best-seeded first.
+        sets = sorted((r for r in ranked[_CHECKED:] if system_fit(target, r["title"])[0] == ON_SYSTEM),
+                      key=lambda r: r.get("seeders") or 0, reverse=True)[:_SETS]
+        checked = list(pool.map(lambda r: (r, _files(prowlarr, r)), named + sets))
 
     candidates = []
     for release, found in checked:

@@ -18,11 +18,3 @@ def similarity(a: str, b: str) -> float:
         return 0.0
     return len(wa & wb) / len(wa | wb)
 
-
-def covers(wanted: str, name: str) -> float:
-    """How much of what's wanted a name has, from 0 to 1, whatever else it adds: a release named "Pixel Pond (USA)
-    [GB] [No-Intro]" has all of Pixel Pond."""
-    ww, wn = words(wanted), words(name)
-    if not ww:
-        return 0.0
-    return len(ww & wn) / len(ww)
